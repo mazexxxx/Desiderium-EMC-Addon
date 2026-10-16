@@ -141,7 +141,7 @@ public final class AutomaticEMCFallback {
                         CreativeModeTab.TAB_SEARCH,
                         variants
                 );
-            } catch (RuntimeException exception) {
+            } catch (RuntimeException | LinkageError exception) {
                 LOGGER.debug(
                         "Could not enumerate variants for {}",
                         ForgeRegistries.ITEMS.getKey(item),
@@ -176,9 +176,21 @@ public final class AutomaticEMCFallback {
                     continue;
                 }
 
+                final long estimatedValue;
+                try {
+                    estimatedValue = estimateValue(stack);
+                } catch (RuntimeException | LinkageError exception) {
+                    LOGGER.warn(
+                            "Skipping fallback EMC for {} because its value could not be estimated.",
+                            key,
+                            exception
+                    );
+                    continue;
+                }
+
                 JsonObject entry = new JsonObject();
                 entry.addProperty("item", key);
-                entry.addProperty("emc", estimateValue(stack));
+                entry.addProperty("emc", estimatedValue);
 
                 entries.add(entry);
                 knownKeys.add(key);
@@ -226,6 +238,9 @@ public final class AutomaticEMCFallback {
             case UNCOMMON -> 8L;
             case RARE -> 64L;
             case EPIC -> 512L;
+            // Forge mods can register additional rarities. Never let an unknown
+            // rarity crash world startup; use the highest built-in baseline.
+            default -> 512L;
         };
 
         // Non-stackable items receive a higher baseline.
