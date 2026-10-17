@@ -28,6 +28,7 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.IOException;
 import java.io.Reader;
+import java.lang.reflect.Method;
 import java.io.Writer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -318,6 +319,17 @@ public final class AutomaticEMCFallback {
         Set<String> recipeDerivedKeys = new HashSet<>();
         Map<String, Long> lowestCandidateSeen = new HashMap<>();
         Collection<Recipe<?>> recipes = server.getRecipeManager().getRecipes();
+
+        // Some modded recipes require fluids in addition to item ingredients.
+        // Do not pretend those costs are zero when estimating item EMC.
+        Set<ResourceLocation> recipesWithFluidComponents = new HashSet<>();
+        for (Recipe<?> recipe : recipes) {
+            if (hasNonEmptyOptionalComponent(recipe, "getFluidIngredients")
+                    || hasNonEmptyOptionalComponent(recipe, "getFluidResults")) {
+                recipesWithFluidComponents.add(recipe.getId());
+            }
+        }
+
         boolean converged = false;
         int passes = 0;
 
@@ -329,6 +341,9 @@ public final class AutomaticEMCFallback {
             boolean addedSeed = false;
 
             for (Recipe<?> recipe : recipes) {
+                if (recipesWithFluidComponents.contains(recipe.getId())) {
+                    continue;
+                }
                 try {
                     ItemStack output = recipe.getResultItem();
                     if (output.isEmpty()) {
@@ -491,6 +506,31 @@ public final class AutomaticEMCFallback {
             }
         }
         return estimates;
+    }
+
+    private static boolean hasNonEmptyOptionalComponent(Recipe<?> recipe, String getterName) {
+        try {
+            Method getter = recipe.getClass().getMethod(getterName);
+            Object result = getter.invoke(recipe);
+            if (result instanceof Collection<?> values) {
+                return !values.isEmpty();
+            }
+            if (result instanceof Iterable<?> values) {
+                return values.iterator().hasNext();
+            }
+            // Unknown non-null return types are treated conservatively. This
+            // prevents silently ignoring a special input when a mod exposes it
+            // through a custom collection type.
+            return result != null;
+        } catch (NoSuchMethodException ignored) {
+            // Ordinary Minecraft recipes do not expose fluid input/output APIs.
+            return false;
+        } catch (ReflectiveOperationException | RuntimeException exception) {
+            LOGGER.debug("Could not inspect optional component {} for recipe {}",
+                    getterName, recipe.getId(), exception);
+            // If inspection fails, do not use this recipe to assign an EMC price.
+            return true;
+        }
     }
 
     private static long safeCeilingDivide(long value, int divisor) {
