@@ -33,10 +33,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.List;
+import java.util.Collection;
 import java.util.Map;
 import java.util.Set;
 
@@ -264,7 +263,7 @@ public final class AutomaticEMCFallback {
             Set<String> generatedKeys) {
         Map<String, Long> prices = new HashMap<>(knownValues);
         Map<String, Long> estimates = new HashMap<>();
-        List<Recipe<?>> recipes = server.getRecipeManager().getRecipes();
+        Collection<Recipe<?>> recipes = server.getRecipeManager().getRecipes();
         boolean changed;
         int passes = 0;
 
