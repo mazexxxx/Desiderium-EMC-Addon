@@ -174,21 +174,32 @@ public final class AutomaticEMCFallback {
             }
         }
 
-        Map<String, Long> estimatedValues = estimateFromRecipes(server, stacksByKey, knownValues, generatedKeys);
+        // Seed every missing item with a provisional fallback. This lets recipe
+        // chains propagate through items that ProjectE itself does not price.
+        Set<String> missingKeys = new HashSet<>(generatedKeys);
+        Map<String, Long> fallbackValues = new HashMap<>();
+        for (Map.Entry<String, ItemStack> itemEntry : stacksByKey.entrySet()) {
+            String key = itemEntry.getKey();
+            if (!knownValues.containsKey(key)) {
+                missingKeys.add(key);
+                fallbackValues.put(key, estimateValue(itemEntry.getValue()));
+            }
+        }
+
+        Map<String, Long> estimatedValues = estimateFromRecipes(
+                server, knownValues, missingKeys, fallbackValues, generatedKeys);
         int recipeDerived = estimatedValues.size();
 
-        // Use a stronger, transparent fallback only for items no usable recipe
-        // can price. Recipe-derived values always take priority over heuristics.
+        // Items with no usable item-input recipe keep the heuristic fallback.
         int heuristicValues = 0;
         for (Map.Entry<String, ItemStack> itemEntry : stacksByKey.entrySet()) {
             String key = itemEntry.getKey();
             ItemStack stack = itemEntry.getValue();
-            if (stack.isEmpty() || stack.getItem() == Items.AIR
-                    || (!generatedKeys.contains(key) && ProjectEAPI.getEMCProxy().hasValue(stack))) {
+            if (stack.isEmpty() || stack.getItem() == Items.AIR || !missingKeys.contains(key)) {
                 continue;
             }
             if (!estimatedValues.containsKey(key)) {
-                estimatedValues.put(key, estimateValue(stack));
+                estimatedValues.put(key, fallbackValues.getOrDefault(key, estimateValue(stack)));
                 heuristicValues++;
             }
         }
@@ -259,58 +270,199 @@ public final class AutomaticEMCFallback {
 
     private static Map<String, Long> estimateFromRecipes(
             MinecraftServer server,
-            Map<String, ItemStack> stacksByKey,
             Map<String, Long> knownValues,
+            Set<String> missingKeys,
+            Map<String, Long> fallbackValues,
             Set<String> generatedKeys) {
+        // Known ProjectE values are fixed. Missing items start with heuristics,
+        // then recipe results replace those provisional seeds where possible.
         Map<String, Long> prices = new HashMap<>(knownValues);
-        Map<String, Long> estimates = new HashMap<>();
+        prices.putAll(fallbackValues);
+        Set<String> recipeDerivedKeys = new HashSet<>();
         Collection<Recipe<?>> recipes = server.getRecipeManager().getRecipes();
-        boolean changed;
+        boolean converged = false;
         int passes = 0;
 
-        do {
-            changed = false;
-            passes++;
+        // Values can depend on recipes several steps away. Re-evaluate until the
+        // prices stabilize; the cap also protects against cyclic/recursive recipes.
+        for (int pass = 1; pass <= 64; pass++) {
+            passes = pass;
+            Map<String, Long> bestCandidates = new HashMap<>();
+            boolean addedSeed = false;
+
             for (Recipe<?> recipe : recipes) {
                 try {
                     ItemStack output = recipe.getResultItem();
                     if (output.isEmpty()) {
                         continue;
                     }
+
                     ItemStack singleOutput = output.copy();
                     singleOutput.setCount(1);
                     String outputKey = NSSItem.createItem(singleOutput).json();
-                    if (prices.containsKey(outputKey) && !generatedKeys.contains(outputKey)) {
-                        continue;
+
+                    if (!missingKeys.contains(outputKey)) {
+                        Long fixed = knownValues.get(outputKey);
+                        if (fixed != null && !generatedKeys.contains(outputKey)) {
+                            continue;
+                        }
+
+                        // Some recipe outputs may not have appeared in the creative
+                        // inventory enumeration; seed them safely if they have no
+                        // existing ProjectE price.
+                        if (!generatedKeys.contains(outputKey)
+                                && ProjectEAPI.getEMCProxy().hasValue(singleOutput)) {
+                            long existing = ProjectEAPI.getEMCProxy().getValue(singleOutput);
+                            if (existing > 0L) {
+                                knownValues.put(outputKey, existing);
+                                prices.put(outputKey, existing);
+                                continue;
+                            }
+                        }
+                        missingKeys.add(outputKey);
+                        long fallback = estimateValue(singleOutput);
+                        fallbackValues.putIfAbsent(outputKey, fallback);
+                        if (!prices.containsKey(outputKey)) {
+                            prices.put(outputKey, fallback);
+                            addedSeed = true;
+                        }
+                    } else if (!prices.containsKey(outputKey)) {
+                        long fallback = estimateValue(singleOutput);
+                        fallbackValues.putIfAbsent(outputKey, fallback);
+                        prices.put(outputKey, fallback);
+                        addedSeed = true;
                     }
 
                     List<Ingredient> ingredients = recipe.getIngredients();
                     if (ingredients.isEmpty()) {
                         continue;
                     }
+
                     long total = 0L;
                     boolean resolvable = true;
+                    boolean hasRealIngredient = false;
+
                     for (Ingredient ingredient : ingredients) {
                         ItemStack[] options = ingredient.getItems();
+
+                        // Shaped recipes contain empty ingredients for unused grid
+                        // slots. They are not ingredients and must not invalidate
+                        // the entire recipe.
+                        if (options.length == 0) {
+                            continue;
+                        }
+                        hasRealIngredient = true;
+
                         long cheapest = Long.MAX_VALUE;
                         for (ItemStack option : options) {
                             if (option.isEmpty()) {
                                 continue;
                             }
+
                             ItemStack one = option.copy();
                             one.setCount(1);
                             String ingredientKey = NSSItem.createItem(one).json();
                             Long known = prices.get(ingredientKey);
+
                             if (known == null && !generatedKeys.contains(ingredientKey)
                                     && ProjectEAPI.getEMCProxy().hasValue(one)) {
                                 long existing = ProjectEAPI.getEMCProxy().getValue(one);
-                                if (existing > 0) {
+                                if (existing > 0L) {
                                     known = existing;
+                                    knownValues.put(ingredientKey, existing);
                                     prices.put(ingredientKey, existing);
                                 }
                             }
-                            if (known != null && known > 0) {
+
+                            if (known == null || known <= 0L) {
+                                long fallback = estimateValue(one);
+                                fallbackValues.putIfAbsent(ingredientKey, fallback);
+                                missingKeys.add(ingredientKey);
+                                prices.put(ingredientKey, fallback);
+                                known = fallback;
+                                addedSeed = true;
+                            }
+
+                            if (known > 0L) {
                                 cheapest = Math.min(cheapest, known);
+                            }
+                        }
+
+                        if (cheapest == Long.MAX_VALUE) {
+                            resolvable = false;
+                            break;
+                        }
+                        total = safeAdd(total, cheapest);
+                    }
+
+                    if (!resolvable || !hasRealIngredient || total <= 0L) {
+                        continue;
+                    }
+
+                    long unitValue = Math.max(1L, safeCeilingDivide(total, output.getCount()));
+                    bestCandidates.merge(outputKey, unitValue, (left, right) -> Math.min(left, right));
+                } catch (RuntimeException | LinkageError exception) {
+                    LOGGER.debug("Skipping recipe {} during fallback EMC estimation", recipe.getId(), exception);
+                }
+            }
+
+            Map<String, Long> nextPrices = new HashMap<>(prices);
+            boolean changed = addedSeed;
+            for (Map.Entry<String, Long> candidate : bestCandidates.entrySet()) {
+                String key = candidate.getKey();
+                long value = candidate.getValue();
+                Long previous = prices.get(key);
+                if (previous == null || previous.longValue() != value) {
+                    changed = true;
+                }
+                nextPrices.put(key, value);
+                recipeDerivedKeys.add(key);
+            }
+
+            prices = nextPrices;
+            if (!changed) {
+                converged = true;
+                break;
+            }
+        }
+
+        if (!converged) {
+            LOGGER.warn("Recipe EMC estimation reached its {}-pass safety limit; using the lowest observed recipe prices for cyclic chains.", passes);
+            // Cyclic conversion recipes may oscillate (for example, compacting and
+            // unpacking). Keeping the lowest candidate seen avoids inflated EMC.
+            Map<String, Long> lowestSeen = new HashMap<>();
+            // Re-run one conservative pass against final prices and retain only
+            // prices not exceeding the candidate currently implied by the recipes.
+            for (Recipe<?> recipe : recipes) {
+                try {
+                    ItemStack output = recipe.getResultItem();
+                    if (output.isEmpty()) {
+                        continue;
+                    }
+                    ItemStack oneOutput = output.copy();
+                    oneOutput.setCount(1);
+                    String outputKey = NSSItem.createItem(oneOutput).json();
+                    if (!recipeDerivedKeys.contains(outputKey)) {
+                        continue;
+                    }
+                    long total = 0L;
+                    boolean hasIngredient = false;
+                    boolean resolvable = true;
+                    for (Ingredient ingredient : recipe.getIngredients()) {
+                        ItemStack[] options = ingredient.getItems();
+                        if (options.length == 0) {
+                            continue;
+                        }
+                        hasIngredient = true;
+                        long cheapest = Long.MAX_VALUE;
+                        for (ItemStack option : options) {
+                            if (option.isEmpty()) {
+                                continue;
+                            }
+                            String ingredientKey = NSSItem.createItem(option).json();
+                            Long price = prices.get(ingredientKey);
+                            if (price != null && price > 0L) {
+                                cheapest = Math.min(cheapest, price);
                             }
                         }
                         if (cheapest == Long.MAX_VALUE) {
@@ -319,26 +471,39 @@ public final class AutomaticEMCFallback {
                         }
                         total = safeAdd(total, cheapest);
                     }
-                    if (!resolvable || total <= 0) {
-                        continue;
-                    }
-                    long unitValue = Math.max(1L, (total + output.getCount() - 1L) / output.getCount());
-                    Long previous = estimates.get(outputKey);
-                    if (previous == null || unitValue < previous) {
-                        estimates.put(outputKey, unitValue);
-                        prices.put(outputKey, unitValue);
-                        changed = true;
+                    if (resolvable && hasIngredient && total > 0L) {
+                        long candidate = safeCeilingDivide(total, output.getCount());
+                        lowestSeen.merge(outputKey, Math.max(1L, candidate), (left, right) -> Math.min(left, right));
                     }
                 } catch (RuntimeException | LinkageError exception) {
-                    LOGGER.debug("Skipping recipe {} during fallback EMC estimation", recipe.getId(), exception);
+                    LOGGER.debug("Skipping cyclic recipe {} during conservative EMC pass", recipe.getId(), exception);
                 }
             }
-        } while (changed && passes < 32);
+            for (String key : recipeDerivedKeys) {
+                Long lower = lowestSeen.get(key);
+                if (lower != null) {
+                    prices.put(key, lower);
+                }
+            }
+        }
 
-        // Return only values that were missing or owned by an older addon run.
-        estimates.entrySet().removeIf(entry ->
-                knownValues.containsKey(entry.getKey()) && !generatedKeys.contains(entry.getKey()));
+        Map<String, Long> estimates = new HashMap<>();
+        for (String key : recipeDerivedKeys) {
+            Long value = prices.get(key);
+            if (value != null && value > 0L) {
+                estimates.put(key, value);
+            }
+        }
         return estimates;
+    }
+
+    private static long safeCeilingDivide(long value, int divisor) {
+        if (value <= 0L) {
+            return 1L;
+        }
+        int safeDivisor = Math.max(1, divisor);
+        long quotient = value / safeDivisor;
+        return value % safeDivisor == 0L ? quotient : quotient + 1L;
     }
 
     private static long safeAdd(long left, long right) {
@@ -377,6 +542,13 @@ public final class AutomaticEMCFallback {
         ResourceLocation id = ForgeRegistries.ITEMS.getKey(stack.getItem());
         String path = id == null ? "" : id.getPath().toLowerCase(java.util.Locale.ROOT);
         long value = legacyEstimateValue(stack);
+
+        // Unknown modded items should not all collapse to EMC 1 merely because
+        // their names do not contain familiar material keywords. Recipe-derived
+        // values can replace this provisional floor when a usable recipe exists.
+        if (id != null && !"minecraft".equals(id.getNamespace())) {
+            value = Math.max(value, 16L);
+        }
 
         // Registry names provide a useful broad tier when no recipe can be
         // evaluated (e.g. uncraftable curios, machine blocks, and special items).
