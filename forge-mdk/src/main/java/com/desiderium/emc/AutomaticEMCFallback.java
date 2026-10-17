@@ -279,6 +279,7 @@ public final class AutomaticEMCFallback {
         Map<String, Long> prices = new HashMap<>(knownValues);
         prices.putAll(fallbackValues);
         Set<String> recipeDerivedKeys = new HashSet<>();
+        Map<String, Long> lowestCandidateSeen = new HashMap<>();
         Collection<Recipe<?>> recipes = server.getRecipeManager().getRecipes();
         boolean converged = false;
         int passes = 0;
@@ -315,7 +316,10 @@ public final class AutomaticEMCFallback {
                             long existing = ProjectEAPI.getEMCProxy().getValue(singleOutput);
                             if (existing > 0L) {
                                 knownValues.put(outputKey, existing);
-                                prices.put(outputKey, existing);
+                                Long previous = prices.put(outputKey, existing);
+                                if (previous == null || previous.longValue() != existing) {
+                                    addedSeed = true;
+                                }
                                 continue;
                             }
                         }
@@ -370,7 +374,10 @@ public final class AutomaticEMCFallback {
                                 if (existing > 0L) {
                                     known = existing;
                                     knownValues.put(ingredientKey, existing);
-                                    prices.put(ingredientKey, existing);
+                                    Long previous = prices.put(ingredientKey, existing);
+                                    if (previous == null || previous.longValue() != existing) {
+                                        addedSeed = true;
+                                    }
                                 }
                             }
 
@@ -417,6 +424,7 @@ public final class AutomaticEMCFallback {
                 }
                 nextPrices.put(key, value);
                 recipeDerivedKeys.add(key);
+                lowestCandidateSeen.merge(key, value, (left, right) -> Math.min(left, right));
             }
 
             prices = nextPrices;
@@ -427,60 +435,11 @@ public final class AutomaticEMCFallback {
         }
 
         if (!converged) {
-            LOGGER.warn("Recipe EMC estimation reached its {}-pass safety limit; using the lowest observed recipe prices for cyclic chains.", passes);
-            // Cyclic conversion recipes may oscillate (for example, compacting and
-            // unpacking). Keeping the lowest candidate seen avoids inflated EMC.
-            Map<String, Long> lowestSeen = new HashMap<>();
-            // Re-run one conservative pass against final prices and retain only
-            // prices not exceeding the candidate currently implied by the recipes.
-            for (Recipe<?> recipe : recipes) {
-                try {
-                    ItemStack output = recipe.getResultItem();
-                    if (output.isEmpty()) {
-                        continue;
-                    }
-                    ItemStack oneOutput = output.copy();
-                    oneOutput.setCount(1);
-                    String outputKey = NSSItem.createItem(oneOutput).json();
-                    if (!recipeDerivedKeys.contains(outputKey)) {
-                        continue;
-                    }
-                    long total = 0L;
-                    boolean hasIngredient = false;
-                    boolean resolvable = true;
-                    for (Ingredient ingredient : recipe.getIngredients()) {
-                        ItemStack[] options = ingredient.getItems();
-                        if (options.length == 0) {
-                            continue;
-                        }
-                        hasIngredient = true;
-                        long cheapest = Long.MAX_VALUE;
-                        for (ItemStack option : options) {
-                            if (option.isEmpty()) {
-                                continue;
-                            }
-                            String ingredientKey = NSSItem.createItem(option).json();
-                            Long price = prices.get(ingredientKey);
-                            if (price != null && price > 0L) {
-                                cheapest = Math.min(cheapest, price);
-                            }
-                        }
-                        if (cheapest == Long.MAX_VALUE) {
-                            resolvable = false;
-                            break;
-                        }
-                        total = safeAdd(total, cheapest);
-                    }
-                    if (resolvable && hasIngredient && total > 0L) {
-                        long candidate = safeCeilingDivide(total, output.getCount());
-                        lowestSeen.merge(outputKey, Math.max(1L, candidate), (left, right) -> Math.min(left, right));
-                    }
-                } catch (RuntimeException | LinkageError exception) {
-                    LOGGER.debug("Skipping cyclic recipe {} during conservative EMC pass", recipe.getId(), exception);
-                }
-            }
+            LOGGER.warn("Recipe EMC estimation reached its {}-pass safety limit; using the lowest candidate observed for cyclic chains.", passes);
+            // Bidirectional/cyclic conversion recipes can oscillate. Choosing the
+            // lowest candidate observed per output is conservative and deterministic.
             for (String key : recipeDerivedKeys) {
-                Long lower = lowestSeen.get(key);
+                Long lower = lowestCandidateSeen.get(key);
                 if (lower != null) {
                     prices.put(key, lower);
                 }
