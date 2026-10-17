@@ -100,6 +100,9 @@ public final class AutomaticEMCFallback {
         // older addon versions (which did not mark generated entries).
         Map<String, ItemStack> stacksByKey = collectItemStacks();
         Set<String> generatedKeys = new HashSet<>();
+        Set<String> legacyGeneratedKeys = new HashSet<>();
+        Map<String, Long> previousGeneratedValues = new HashMap<>();
+        int generatedEntryCount = 0;
         for (JsonElement element : entries) {
             if (!element.isJsonObject()) {
                 continue;
@@ -111,6 +114,14 @@ public final class AutomaticEMCFallback {
             String key = entry.get("item").getAsString();
             if (entry.has(GENERATED_MARKER) && entry.get(GENERATED_MARKER).getAsBoolean()) {
                 generatedKeys.add(key);
+                generatedEntryCount++;
+                if (entry.has("emc") && entry.get("emc").isJsonPrimitive()) {
+                    try {
+                        previousGeneratedValues.put(key, entry.get("emc").getAsLong());
+                    } catch (RuntimeException ignored) {
+                        // Invalid values are repaired by the next generated write.
+                    }
+                }
                 continue;
             }
 
@@ -121,8 +132,12 @@ public final class AutomaticEMCFallback {
             if (stack != null && isModdedItem(stack)
                     && entry.has("emc") && entry.get("emc").isJsonPrimitive()) {
                 try {
-                    if (entry.get("emc").getAsLong() == legacyEstimateValue(stack)) {
+                    long oldValue = entry.get("emc").getAsLong();
+                    if (oldValue == legacyEstimateValue(stack)) {
                         generatedKeys.add(key);
+                        legacyGeneratedKeys.add(key);
+                        previousGeneratedValues.put(key, oldValue);
+                        generatedEntryCount++;
                     }
                 } catch (RuntimeException ignored) {
                     // Malformed user-authored entries are preserved.
@@ -202,6 +217,28 @@ public final class AutomaticEMCFallback {
                 estimatedValues.put(key, fallbackValues.getOrDefault(key, estimateValue(stack)));
                 heuristicValues++;
             }
+        }
+
+        // Avoid rewriting the file and running /reload on every server start
+        // when all generated entries are already present with the same values.
+        boolean generatedValuesUnchanged = !generatedKeys.isEmpty()
+                && legacyGeneratedKeys.isEmpty()
+                && generatedEntryCount == generatedKeys.size()
+                && generatedKeys.equals(estimatedValues.keySet())
+                && previousGeneratedValues.size() == estimatedValues.size();
+        if (generatedValuesUnchanged) {
+            for (Map.Entry<String, Long> estimate : estimatedValues.entrySet()) {
+                Long previous = previousGeneratedValues.get(estimate.getKey());
+                if (previous == null || previous.longValue() != estimate.getValue()) {
+                    generatedValuesUnchanged = false;
+                    break;
+                }
+            }
+        }
+        if (generatedValuesUnchanged) {
+            LOGGER.info("Automatic EMC fallback: {} generated EMC values are unchanged; skipping file write and reload.",
+                    estimatedValues.size());
+            return;
         }
 
         if (estimatedValues.isEmpty() && generatedKeys.isEmpty()) {
