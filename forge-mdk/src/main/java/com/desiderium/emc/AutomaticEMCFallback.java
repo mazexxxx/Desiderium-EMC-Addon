@@ -525,7 +525,7 @@ public final class AutomaticEMCFallback {
         } catch (NoSuchMethodException ignored) {
             // Ordinary Minecraft recipes do not expose fluid input/output APIs.
             return false;
-        } catch (ReflectiveOperationException | RuntimeException exception) {
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError exception) {
             LOGGER.debug("Could not inspect optional component {} for recipe {}",
                     getterName, recipe.getId(), exception);
             // If inspection fails, do not use this recipe to assign an EMC price.
